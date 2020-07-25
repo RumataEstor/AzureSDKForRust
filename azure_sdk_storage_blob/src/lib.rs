@@ -6,7 +6,8 @@ extern crate log;
 #[macro_use]
 extern crate serde_derive;
 #[macro_use]
-extern crate azure_sdk_core;
+pub extern crate azure_sdk_core;
+pub use azure_sdk_storage_core;
 pub mod blob;
 pub mod container;
 pub mod prelude;

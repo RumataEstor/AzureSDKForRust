@@ -1,4 +1,5 @@
-#![feature(async_closure)]
+//#![f_eature(async_closure)]
+
 #[macro_use]
 extern crate serde_derive;
 extern crate log;
