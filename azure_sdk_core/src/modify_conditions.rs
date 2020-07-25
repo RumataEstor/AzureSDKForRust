@@ -29,7 +29,7 @@ pub enum IfMatchCondition<'a> {
 }
 
 impl<'a> IfMatchCondition<'a> {
-    pub(crate) fn add_header(&self, builder: Builder) -> Builder {
+    pub fn add_header(&self, builder: Builder) -> Builder {
         match self {
             IfMatchCondition::Match(etag) => builder.header(IF_MATCH, *etag),
             IfMatchCondition::NotMatch(etag) => builder.header(IF_NONE_MATCH, *etag),

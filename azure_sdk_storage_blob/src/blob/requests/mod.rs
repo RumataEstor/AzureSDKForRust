@@ -25,7 +25,7 @@ pub use self::change_blob_lease_builder::ChangeBlobLeaseBuilder;
 pub use self::clear_page_builder::ClearPageBuilder;
 pub use self::delete_blob_builder::DeleteBlobBuilder;
 pub use self::delete_blob_snapshot_builder::DeleteBlobSnapshotBuilder;
-pub use self::get_blob_builder::GetBlobBuilder;
+pub use self::get_blob_builder::{ConditionalResult, GetBlobBuilder};
 pub use self::get_block_list_builder::GetBlockListBuilder;
 pub use self::put_append_blob_builder::PutAppendBlobBuilder;
 pub use self::put_append_block_builder::PutAppendBlockBuilder;

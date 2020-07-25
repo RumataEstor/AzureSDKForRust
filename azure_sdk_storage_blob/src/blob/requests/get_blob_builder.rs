@@ -1,6 +1,6 @@
 use crate::blob::responses::GetBlobResponse;
 use crate::blob::{generate_blob_uri, Blob};
-use azure_sdk_core::errors::{check_status_extract_headers_and_body, AzureError};
+use azure_sdk_core::errors::{extract_status_headers_and_body, AzureError, UnexpectedHTTPResult};
 use azure_sdk_core::headers::RANGE_GET_CONTENT_MD5;
 use azure_sdk_core::lease::LeaseId;
 use azure_sdk_core::prelude::*;
@@ -9,6 +9,7 @@ use azure_sdk_core::util::RequestBuilderExt;
 use azure_sdk_core::{No, ToAssign, Yes};
 use azure_sdk_storage_core::prelude::*;
 use chrono::{DateTime, Utc};
+use http::request::Builder;
 use hyper::{Method, StatusCode};
 use std::marker::PhantomData;
 
@@ -339,50 +340,218 @@ where
     C: Client,
 {
     pub async fn finalize(self) -> Result<GetBlobResponse, AzureError> {
-        let container_name = self.container_name().to_owned();
-        let blob_name = self.blob_name().to_owned();
-        let snapshot_time = self.snapshot();
+        process_request(self).await
+    }
+}
 
-        let mut uri =
-            generate_blob_uri(self.client(), self.container_name(), self.blob_name(), None);
+pub trait Requester {
+    type O;
+    fn build_request(&self, builder: Builder) -> Builder;
+    fn process_response(
+        &self,
+        status: hyper::StatusCode,
+        headers: hyper::HeaderMap,
+        body: hyper::body::Bytes,
+    ) -> Result<Self::O, AzureError>;
+}
 
-        let mut f_first = true;
-        if let Some(snapshot) = SnapshotOption::to_uri_parameter(&self) {
-            uri = format!("{}?{}", uri, snapshot);
-            f_first = false;
+async fn process_request<'a, TRequester, C>(s: TRequester) -> Result<TRequester::O, AzureError>
+where
+    TRequester: Requester
+        + SnapshotOption
+        + TimeoutOption
+        + ClientRequired<'a, C>
+        + BlobNameRequired<'a>
+        + ContainerNameRequired<'a>,
+    C: Client + 'a,
+{
+    let mut uri = generate_blob_uri(s.client(), s.container_name(), s.blob_name(), None);
+
+    let mut f_first = true;
+    if let Some(snapshot) = SnapshotOption::to_uri_parameter(&s) {
+        uri = format!("{}?{}", uri, snapshot);
+        f_first = false;
+    }
+    if let Some(timeout) = TimeoutOption::to_uri_parameter(&s) {
+        uri = format!("{}{}{}", uri, if f_first { "?" } else { "&" }, timeout);
+    }
+
+    trace!("uri == {:?}", uri);
+
+    let future_response = s.client().perform_request(
+        &uri,
+        &Method::GET,
+        &|request| s.build_request(request),
+        None,
+    )?;
+
+    let (status, headers, body) = extract_status_headers_and_body(future_response).await?;
+    s.process_response(status, headers, body)
+}
+
+impl<'a, C> Requester for GetBlobBuilder<'a, C, Yes, Yes>
+where
+    Self: LeaseIdOption<'a>,
+    C: Client,
+{
+    type O = GetBlobResponse;
+
+    fn build_request(&self, mut request: Builder) -> Builder {
+        if let Some(r) = self.range() {
+            request = LeaseIdOption::add_header(self, request);
+            request = RangeOption::add_header(self, request);
+
+            if r.len() <= 4 * 1024 * 1024 {
+                request = request.header_static(RANGE_GET_CONTENT_MD5, "true");
+            }
         }
-        if let Some(timeout) = TimeoutOption::to_uri_parameter(&self) {
-            uri = format!("{}{}{}", uri, if f_first { "?" } else { "&" }, timeout);
-        }
+        request
+    }
 
-        trace!("uri == {:?}", uri);
-
-        let future_response = self.client().perform_request(
-            &uri,
-            &Method::GET,
-            &|mut request| {
-                if let Some(r) = self.range() {
-                    request = LeaseIdOption::add_header(&self, request);
-                    request = RangeOption::add_header(&self, request);
-
-                    if r.len() <= 4 * 1024 * 1024 {
-                        request = request.header_static(RANGE_GET_CONTENT_MD5, "true");
-                    }
-                }
-                request
-            },
-            None,
-        )?;
-
+    fn process_response(
+        &self,
+        status: hyper::StatusCode,
+        headers: hyper::HeaderMap,
+        body: hyper::body::Bytes,
+    ) -> Result<GetBlobResponse, AzureError> {
         let expected_status_code = if self.range().is_some() {
             StatusCode::PARTIAL_CONTENT
         } else {
             StatusCode::OK
         };
 
-        let (headers, body) =
-            check_status_extract_headers_and_body(future_response, expected_status_code).await?;
+        if status != expected_status_code {
+            return Err(AzureError::UnexpectedHTTPResult(UnexpectedHTTPResult::new(
+                expected_status_code,
+                status,
+                std::str::from_utf8(&body)?,
+            )));
+        }
+
+        let container_name = self.container_name();
+        let blob_name = self.blob_name();
+        let snapshot_time = self.snapshot();
+
         let blob = Blob::from_headers(&blob_name, &container_name, snapshot_time, &headers)?;
         GetBlobResponse::from_response(&headers, blob, &body)
+    }
+}
+
+pub struct GetConditionalBlobBuilder<'a, TGetBlobBuilder, TClient> {
+    builder: TGetBlobBuilder,
+    if_match_condition: IfMatchCondition<'a>,
+    _client: PhantomData<&'a TClient>,
+}
+
+impl<'a, TClient> IfMatchConditionSupport<'a> for GetBlobBuilder<'a, TClient, Yes, Yes>
+where
+    TClient: Client,
+{
+    type O = GetConditionalBlobBuilder<'a, GetBlobBuilder<'a, TClient, Yes, Yes>, TClient>;
+
+    fn with_if_match_condition(self, if_match_condition: IfMatchCondition<'a>) -> Self::O {
+        GetConditionalBlobBuilder {
+            builder: self,
+            if_match_condition,
+            _client: PhantomData {},
+        }
+    }
+}
+
+impl<'a, TGetBlobBuilder, TClient> ClientRequired<'a, TClient>
+    for GetConditionalBlobBuilder<'a, TGetBlobBuilder, TClient>
+where
+    TGetBlobBuilder: ClientRequired<'a, TClient>,
+    TClient: Client,
+{
+    fn client(&self) -> &'a TClient {
+        self.builder.client()
+    }
+}
+
+impl<'a, TGetBlobBuilder, TClient> BlobNameRequired<'a>
+    for GetConditionalBlobBuilder<'a, TGetBlobBuilder, TClient>
+where
+    TGetBlobBuilder: BlobNameRequired<'a>,
+{
+    fn blob_name(&self) -> &'a str {
+        self.builder.blob_name()
+    }
+}
+
+impl<'a, TGetBlobBuilder, TClient> ContainerNameRequired<'a>
+    for GetConditionalBlobBuilder<'a, TGetBlobBuilder, TClient>
+where
+    TGetBlobBuilder: ContainerNameRequired<'a>,
+{
+    fn container_name(&self) -> &'a str {
+        self.builder.container_name()
+    }
+}
+
+impl<'a, TGetBlobBuilder, TClient> SnapshotOption
+    for GetConditionalBlobBuilder<'a, TGetBlobBuilder, TClient>
+where
+    TGetBlobBuilder: SnapshotOption,
+{
+    fn snapshot(&self) -> Option<DateTime<Utc>> {
+        self.builder.snapshot()
+    }
+}
+
+impl<'a, TGetBlobBuilder, TClient> TimeoutOption
+    for GetConditionalBlobBuilder<'a, TGetBlobBuilder, TClient>
+where
+    TGetBlobBuilder: TimeoutOption,
+{
+    fn timeout(&self) -> Option<u64> {
+        self.builder.timeout()
+    }
+}
+
+pub enum ConditionalResult<TResponse> {
+    NotModified(),
+    Ok(TResponse),
+}
+
+impl<'a, TGetBlobBuilder, TClient> Requester
+    for GetConditionalBlobBuilder<'a, TGetBlobBuilder, TClient>
+where
+    TGetBlobBuilder: Requester,
+{
+    type O = ConditionalResult<TGetBlobBuilder::O>;
+
+    fn build_request(&self, mut builder: Builder) -> Builder {
+        builder = self.builder.build_request(builder);
+        self.if_match_condition.add_header(builder)
+    }
+
+    fn process_response(
+        &self,
+        status: hyper::StatusCode,
+        headers: hyper::HeaderMap,
+        body: hyper::body::Bytes,
+    ) -> Result<Self::O, AzureError> {
+        if status == StatusCode::NOT_MODIFIED {
+            return Ok(ConditionalResult::NotModified());
+        }
+
+        let result = self.builder.process_response(status, headers, body)?;
+        Ok(ConditionalResult::Ok(result))
+    }
+}
+
+impl<'a, TGetBlobBuilder, TClient> GetConditionalBlobBuilder<'a, TGetBlobBuilder, TClient>
+where
+    TGetBlobBuilder: Requester
+        + SnapshotOption
+        + TimeoutOption
+        + BlobNameRequired<'a>
+        + ContainerNameRequired<'a>
+        + ClientRequired<'a, TClient>,
+    TClient: Client,
+{
+    pub async fn finalize(self) -> Result<ConditionalResult<TGetBlobBuilder::O>, AzureError> {
+        process_request(self).await
     }
 }

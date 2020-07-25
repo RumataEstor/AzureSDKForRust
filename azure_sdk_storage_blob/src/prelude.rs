@@ -1,3 +1,4 @@
+pub use crate::blob::requests::ConditionalResult;
 pub use crate::blob::{
     BlobBlockType, BlockList, BlockListRequired, BlockListSupport, BlockListType,
     BlockListTypeRequired, BlockListTypeSupport,
